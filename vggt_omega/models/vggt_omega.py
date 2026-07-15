@@ -23,13 +23,30 @@ class VGGTOmega(nn.Module):
         enable_camera: bool = True,
         enable_depth: bool = True,
         enable_alignment: bool = False,
+        hybrid_prefix_blocks: int | None = None,
+        loop_steps: int | None = None,
+        shared_block_init_index: int | None = None,
     ) -> None:
         super().__init__()
 
-        self.aggregator = Aggregator(patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            hybrid_prefix_blocks=hybrid_prefix_blocks,
+            loop_steps=loop_steps,
+            shared_block_init_index=shared_block_init_index,
+        )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
-        self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
+        self.dense_head = (
+            DenseHead(
+                dim_in=2 * embed_dim,
+                patch_size=patch_size,
+                intermediate_layer_idx=list(self.aggregator.cached_layer_indices),
+            )
+            if enable_depth
+            else None
+        )
         self.text_alignment_head = TextAlignmentHead(dim_in=2 * embed_dim) if enable_alignment else None
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:

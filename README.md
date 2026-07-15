@@ -81,6 +81,26 @@ registers = camera_and_register_tokens[:, :, 1:]
 
 For the text-aligned checkpoint, use `VGGTOmega(enable_alignment=True)` with `image_resolution=256` and read `predictions["text_alignment_embedding"]`.
 
+### Hybrid prefix + looped tail
+
+The optional hybrid aggregator keeps an independently parameterized prefix and
+replaces the remaining aggregator blocks with one shared frame/global block pair:
+
+```python
+model = VGGTOmega(
+    hybrid_prefix_blocks=6,
+    loop_steps=18,
+).to("cuda").eval()
+model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+```
+
+Each loop step runs frame attention followed by global inter-frame attention.
+Loading a standard 24-block checkpoint keeps blocks 0--5 and initializes the
+shared pair from block 7 by default, the first replaced block that originally
+used global inter-frame attention. Pass `shared_block_init_index` to choose a
+different replaced block. Omitting `hybrid_prefix_blocks` preserves the
+original 24-block architecture and checkpoint behavior.
+
 
 ## Interactive Demo
 
