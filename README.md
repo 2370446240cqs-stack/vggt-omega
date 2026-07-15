@@ -122,6 +122,25 @@ The demo accepts uploaded images or a video, runs camera and depth inference,
 and visualizes the depth-unprojected point cloud and predicted cameras as a GLB
 scene.
 
+## Training
+
+Supervised fine-tuning is provided by `train.py`. The input is a JSONL manifest
+with one sequence NPZ per line; see the module docstring for the complete array
+schema. Images must already be at a common patch-aligned resolution, and camera
+extrinsics use the camera-from-world OpenCV convention.
+
+```bash
+python train.py \
+  --train-manifest data/train.jsonl \
+  --checkpoint checkpoints/vggt_omega_1b_512.pt \
+  --output-dir runs/finetune \
+  --frames 4 --batch-size 1 --accumulation-steps 8
+```
+
+Add `--enable-alignment` when NPZ files contain `text_embedding` targets and the
+initial checkpoint includes the text-alignment head. Use `--resume
+runs/finetune/last.pt` to continue an interrupted run.
+
 ## Runtime and GPU Memory
 
 We benchmark the end-to-end peak GPU memory usage of `VGGT-Omega-1B-512` on a

@@ -83,6 +83,20 @@ def assert_shared_block_initialization(
             torch.testing.assert_close(shared_value, original_state_dict[source_key])
 
 
+def assert_residual_gates(model: VGGTOmega) -> None:
+    expected_value = 1.0 / LOOP_STEPS
+    for gate_name in ("shared_frame_gate", "shared_global_gate"):
+        gate = getattr(model.aggregator, gate_name)
+        if gate is None or gate.ndim != 0:
+            raise AssertionError(f"{gate_name} is not a scalar parameter")
+        if not gate.requires_grad:
+            raise AssertionError(f"{gate_name} is not trainable")
+        torch.testing.assert_close(
+            gate.detach(),
+            torch.tensor(expected_value, dtype=gate.dtype, device=gate.device),
+        )
+
+
 def register_loop_counters(model: VGGTOmega) -> tuple[dict[str, int], list[torch.utils.hooks.RemovableHandle]]:
     aggregator = model.aggregator
     if aggregator.shared_frame_block is None or aggregator.shared_inter_frame_block is None:
@@ -150,7 +164,9 @@ def main() -> None:
     if load_result.missing_keys or load_result.unexpected_keys:
         raise AssertionError(f"Checkpoint loading failed strict validation: {load_result}")
     assert_shared_block_initialization(model, state_dict)
+    assert_residual_gates(model)
     print("Checkpoint remapping: passed")
+    print(f"Residual scalar gates: passed (initial value={1.0 / LOOP_STEPS:.6f})")
 
     del state_dict
     gc.collect()
@@ -185,6 +201,8 @@ def main() -> None:
     print("Shared-block call counts: passed")
     print("Prediction validation: passed")
     print(f"Model parameters: {parameter_count / 1e6:.2f} M")
+    print(f"Frame gate: {model.aggregator.shared_frame_gate.item():.6f}")
+    print(f"Global gate: {model.aggregator.shared_global_gate.item():.6f}")
     print(f"Forward time: {elapsed_seconds:.3f} s")
     print(f"Peak CUDA tensor memory: {peak_memory_gib:.2f} GiB")
     for name, value in predictions.items():

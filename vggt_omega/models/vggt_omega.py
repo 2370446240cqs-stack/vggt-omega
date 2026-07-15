@@ -55,8 +55,12 @@ class VGGTOmega(nn.Module):
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
 
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+        device_type = images.device.type
+        if device_type == "cuda":
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            amp_dtype = torch.bfloat16
+        with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=device_type in {"cuda", "cpu"}):
             aggregated_tokens_list, patch_token_start = self.aggregator(images)
 
         final_tokens = aggregated_tokens_list[-1]
@@ -66,7 +70,7 @@ class VGGTOmega(nn.Module):
         predictions = {
             "camera_and_register_tokens": final_tokens[:, :, :patch_token_start].contiguous(),
         }
-        with torch.autocast(device_type="cuda", enabled=False):
+        with torch.autocast(device_type=device_type, enabled=False):
             if self.camera_head is not None:
                 predictions["pose_enc"] = self.camera_head(
                     aggregated_tokens_list,
