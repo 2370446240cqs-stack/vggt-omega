@@ -26,6 +26,7 @@ class VGGTOmega(nn.Module):
         hybrid_prefix_blocks: int | None = None,
         loop_steps: int | None = None,
         shared_block_init_index: int | None = None,
+        loop_residual_gate_init: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -35,6 +36,7 @@ class VGGTOmega(nn.Module):
             hybrid_prefix_blocks=hybrid_prefix_blocks,
             loop_steps=loop_steps,
             shared_block_init_index=shared_block_init_index,
+            loop_residual_gate_init=loop_residual_gate_init,
         )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

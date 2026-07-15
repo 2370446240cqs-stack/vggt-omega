@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -32,6 +34,7 @@ class Aggregator(nn.Module):
         hybrid_prefix_blocks: int | None = None,
         loop_steps: int | None = None,
         shared_block_init_index: int | None = None,
+        loop_residual_gate_init: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -48,11 +51,20 @@ class Aggregator(nn.Module):
                 raise ValueError(f"loop_steps must be positive in hybrid mode, got {loop_steps}")
             prefix_depth = hybrid_prefix_blocks
             total_steps = prefix_depth + loop_steps
+            if loop_residual_gate_init is None:
+                loop_residual_gate_init = 1.0 / loop_steps
+            if not math.isfinite(loop_residual_gate_init) or not 0.0 <= loop_residual_gate_init <= 1.0:
+                raise ValueError(
+                    "loop_residual_gate_init must be finite and within [0, 1], "
+                    f"got {loop_residual_gate_init}"
+                )
         else:
             if loop_steps is not None:
                 raise ValueError("loop_steps requires hybrid_prefix_blocks")
             if shared_block_init_index is not None:
                 raise ValueError("shared_block_init_index requires hybrid_prefix_blocks")
+            if loop_residual_gate_init is not None:
+                raise ValueError("loop_residual_gate_init requires hybrid_prefix_blocks")
             prefix_depth = depth
             total_steps = depth
 
@@ -87,6 +99,8 @@ class Aggregator(nn.Module):
         if self.is_hybrid:
             self.shared_frame_block = SelfAttentionBlock(**block_kwargs)
             self.shared_inter_frame_block = SelfAttentionBlock(**block_kwargs)
+            self.shared_frame_gate = nn.Parameter(torch.tensor(loop_residual_gate_init, dtype=torch.float32))
+            self.shared_global_gate = nn.Parameter(torch.tensor(loop_residual_gate_init, dtype=torch.float32))
             if shared_block_init_index is None:
                 register_indices = set(register_attention_block_indices)
                 shared_block_init_index = next(
@@ -101,6 +115,8 @@ class Aggregator(nn.Module):
         else:
             self.shared_frame_block = None
             self.shared_inter_frame_block = None
+            self.shared_frame_gate = None
+            self.shared_global_gate = None
 
         self.depth = depth
         self.prefix_depth = prefix_depth
@@ -156,6 +172,14 @@ class Aggregator(nn.Module):
     def _remap_standard_checkpoint_for_hybrid(self, state_dict, prefix: str) -> None:
         if self.shared_block_init_index is None:
             raise RuntimeError("Hybrid aggregator has no shared block initialization index")
+
+        for gate_name in ("shared_frame_gate", "shared_global_gate"):
+            gate_key = f"{prefix}{gate_name}"
+            if gate_key not in state_dict:
+                gate = getattr(self, gate_name)
+                if gate is None:
+                    raise RuntimeError(f"Hybrid aggregator has no {gate_name}")
+                state_dict[gate_key] = gate.detach().clone()
 
         block_mappings = (
             ("frame_blocks", "shared_frame_block"),
@@ -238,7 +262,12 @@ class Aggregator(nn.Module):
                 outputs.append(None)
 
         if self.is_hybrid:
-            if self.shared_frame_block is None or self.shared_inter_frame_block is None:
+            if (
+                self.shared_frame_block is None
+                or self.shared_inter_frame_block is None
+                or self.shared_frame_gate is None
+                or self.shared_global_gate is None
+            ):
                 raise RuntimeError("Hybrid aggregator shared blocks are not initialized")
             for loop_idx in range(self.loop_steps):
                 step_idx = self.prefix_depth + loop_idx
@@ -250,6 +279,7 @@ class Aggregator(nn.Module):
                     embed_dim,
                     self.shared_frame_block,
                     frame_rope,
+                    self.shared_frame_gate,
                 )
                 tokens = self._run_inter_frame_attention_block(
                     tokens,
@@ -259,6 +289,7 @@ class Aggregator(nn.Module):
                     embed_dim,
                     self.shared_inter_frame_block,
                     "global",
+                    self.shared_global_gate,
                 )
                 if step_idx in self._cached_layer_indices_set:
                     outputs.append(torch.cat([frame_tokens, tokens], dim=-1))
@@ -276,9 +307,11 @@ class Aggregator(nn.Module):
         embed_dim: int,
         block: SelfAttentionBlock,
         rope_sincos: tuple[torch.Tensor, torch.Tensor],
+        residual_gate: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = tokens.view(batch_size * num_frames, num_tokens, embed_dim)
-        tokens = block(tokens, rope_sincos)
+        updated_tokens = block(tokens, rope_sincos)
+        tokens = _apply_outer_residual_gate(tokens, updated_tokens, residual_gate)
         return tokens, tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
     def _run_inter_frame_attention_block(
@@ -290,12 +323,14 @@ class Aggregator(nn.Module):
         embed_dim: int,
         block: SelfAttentionBlock,
         attention_type: str,
+        residual_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type == "global":
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
-            tokens = block(tokens, None)
+            updated_tokens = block(tokens, None)
+            tokens = _apply_outer_residual_gate(tokens, updated_tokens, residual_gate)
             return tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type != "register":
@@ -313,7 +348,8 @@ class Aggregator(nn.Module):
             embed_dim,
         )
 
-        camera_and_register_tokens = block(camera_and_register_tokens, None)
+        updated_tokens = block(camera_and_register_tokens, None)
+        camera_and_register_tokens = _apply_outer_residual_gate(camera_and_register_tokens, updated_tokens, residual_gate)
         tokens = torch.cat([camera_and_register_tokens, patch_tokens], dim=1)
 
         camera_and_register_tokens = tokens[:, : num_frames * patch_token_start].view(
@@ -329,6 +365,17 @@ class Aggregator(nn.Module):
             embed_dim,
         )
         return torch.cat([camera_and_register_tokens, patch_tokens], dim=2)
+
+
+def _apply_outer_residual_gate(
+    input_tokens: torch.Tensor,
+    updated_tokens: torch.Tensor,
+    residual_gate: torch.Tensor | None,
+) -> torch.Tensor:
+    if residual_gate is None:
+        return updated_tokens
+    gate = residual_gate.to(dtype=updated_tokens.dtype, device=updated_tokens.device)
+    return input_tokens + gate * (updated_tokens - input_tokens)
 
 
 def _scale_cached_layer_indices(total_steps: int) -> tuple[int, ...]:
